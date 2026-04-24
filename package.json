@@ -1,0 +1,65 @@
+{
+    "name": "codemind",
+    "displayName": "CodeMind",
+    "description": "AI Coding Assistant",
+    "version": "0.0.1",
+    "engines": {
+        "vscode": "^1.96.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [],
+    "main": "./dist/extension.js",
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "codemind-explorer",
+                    "title": "CodeMind",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "codemind-explorer": [
+                {
+                    "type": "webview",
+                    "id": "codemind.chatView",
+                    "name": "CodeMind Chat"
+                }
+            ]
+        },
+        "keybindings": [
+            {
+            "command": "editor.action.inlineSuggest.trigger",
+            "key": "ctrl+alt+a",
+            "when": "editorTextFocus && !editorReadonly"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run package",
+        "compile": "webpack",
+        "watch": "webpack --watch",
+        "package": "webpack --mode production --devtool hidden-source-map",
+        "test-compile": "tsc -p ./",
+        "test-watch": "tsc -watch -p ./",
+        "pretest": "npm run test-compile && npm run lint",
+        "lint": "eslint src --ext ts",
+        "test": "vscode-test"
+    },
+    "devDependencies": {
+        "@types/mocha": "^10.0.10",
+        "@types/node": "^20.19.39",
+        "@types/vscode": "^1.96.0",
+        "ts-loader": "^9.5.1",
+        "typescript": "^5.7.2",
+        "webpack": "^5.97.1",
+        "webpack-cli": "^6.0.1"
+    },
+    "dependencies": {
+        "axios": "^1.7.9"
+    }
+    
+}

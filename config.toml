@@ -1,0 +1,6 @@
+[llm]
+model = "openai/gpt-4o"
+base_url = "http://host.docker.internal:11434/v1"
+api_key = "none"
+drop_params = true
+num_ctx = 4096
