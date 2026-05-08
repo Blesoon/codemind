@@ -216,7 +216,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private _executeTerminalCommand(command: string) {
+    private async _executeTerminalCommand(command: string) {
+        // [보안 패치] 직접 명령어 실행 경고창 추가
+        const answer = await vscode.window.showWarningMessage(
+            `⚠️ AI가 다음 터미널 명령어를 실행하려고 합니다.\n명령어: ${command}`,
+            { modal: true },
+            "실행 허용", "거부"
+        );
+
+        if (answer !== "실행 허용") {
+            vscode.window.showInformationMessage("명령어 실행이 취소되었습니다.");
+            return;
+        }
+
         let terminal = vscode.window.activeTerminal;
         if (!terminal) terminal = vscode.window.createTerminal("CodeMind Terminal");
         terminal.show();
@@ -226,7 +238,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async _executeTerminalAndGetOutput(command: string): Promise<string> {
         return new Promise(async (resolve) => {
             const workspaceFolders = vscode.workspace.workspaceFolders;
-            if (!workspaceFolders) return resolve("");
+            if (!workspaceFolders) return resolve("워크스페이스를 찾을 수 없습니다.");
+
+            // [보안 패치] Audit 루프에서도 무단 실행 방지
+            const answer = await vscode.window.showWarningMessage(
+                `⚠️ AI 검증 에이전트가 다음 명령어를 백그라운드에서 실행하려고 합니다.\n명령어: ${command}`,
+                { modal: true },
+                "실행 허용", "거부"
+            );
+
+            if (answer !== "실행 허용") {
+                return resolve("[에러] 사용자가 명령어 실행을 거부했습니다.");
+            }
 
             const logPath = path.join(workspaceFolders[0].uri.fsPath, 'test_output.log');
             const fullCommand = `${command} > "${logPath}" 2>&1`; 
@@ -241,7 +264,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     const logContent = await vscode.workspace.fs.readFile(logUri);
                     resolve(Buffer.from(logContent).toString('utf8'));
                 } catch (e) {
-                    resolve("결과 로그를 읽을 수 없습니다.");
+                    resolve("결과 로그를 읽을 수 없거나 테스트가 너무 오래 걸렸습니다.");
                 }
             }, 5000); 
         });
@@ -251,9 +274,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const summary = await getProjectSummary();
         const hierarchyGuide = `
 [프레임워크 연동 규칙]
-- Backend: Spring Boot (Gradle 사용)
-- Frontend: Vue.js & Nexacro N
-- Nexacro 연동: 데이터셋(Dataset) 기반 통신.
 - 경로: 루트 기준 상대 경로 엄격 준수.`;
 
         const coreFiles = await vscode.workspace.findFiles(
@@ -263,9 +283,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         
         let coreContent = "";
         for (const file of coreFiles) {
-            const doc = await vscode.workspace.openTextDocument(file);
-            const relPath = vscode.workspace.asRelativePath(file);
-            coreContent += `\n[FILE: ${relPath}]\n${doc.getText().substring(0, 1000)}\n`;
+            try {
+                const doc = await vscode.workspace.openTextDocument(file);
+                const relPath = vscode.workspace.asRelativePath(file);
+                // 파일 컨텍스트 추출량 조정
+                coreContent += `\n[FILE: ${relPath}]\n${doc.getText().substring(0, 800)}...\n`;
+            } catch (e) {
+                console.warn("파일을 읽는 중 오류 발생:", file.fsPath);
+            }
         }
         
         return `${hierarchyGuide}\n\n[프로젝트 구조]\n${summary}\n\n[핵심 코드 참고]\n${coreContent}`;
@@ -307,7 +332,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } else {
             webviewView.webview.postMessage({ 
                 command: 'response-chunk', 
-                text: "\n\n✅ **검증 완료!** 모든 테스트를 통과하였습니다." 
+                text: "\n\n✅ **검증 완료!** 테스트를 통과했거나 실행 거부되었습니다." 
             });
             webviewView.webview.postMessage({ command: 'response-end' });
         }
@@ -315,7 +340,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleSummarization() {
         const toSummarize = this._chatHistory.slice(0, 4);
-        const summaryPrompt = `### Instruction:\n다음 대화를 한 문장으로 요약해줘(한글):\n${toSummarize.map(m => m.content).join('\n')}\n\n### Response:\n`;
+        const summaryPrompt = `### Instruction:\n다음 대화를 핵심 개발 맥락 위주로 요약해줘:\n${toSummarize.map(m => m.content).join('\n')}\n\n### Response:\n`;
         try {
             const summary = await callOllamaStatic(summaryPrompt);
             if (summary) {
@@ -327,10 +352,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleAutoFileCreation(response: string) {
         const fileBlocks = response.matchAll(/FILE_PATH:\s*(.+?)\s*FILE_CONTENT:\s*([\s\S]+?)\s*FILE_END/gi);
-        let processedAny = false;
 
         for (const match of fileBlocks) {
-            processedAny = true;
             const filePath = match[1].trim().replace(/`/g, '');
             let newContent = match[2].trim();
             newContent = newContent.replace(/^```[a-z]*\n/i, '').replace(/\n```$/, '');
@@ -345,14 +368,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 let fileExists = true;
                 try { await vscode.workspace.fs.stat(fileUri); } catch { fileExists = false; }
 
-                const action = fileExists ? "변경사항을 적용" : "새 파일을 생성";
-                const answer = await vscode.window.showInformationMessage(
-                    `AI가 [${filePath}]에 대해 ${action}하시겠습니까?`,
-                    "적용(Apply)", "건너뛰기", "모두 적용(All)"
-                );
+                if (fileExists) {
+                    // [UX 패치] 기존 파일이 있을 경우 Diff 보기 기능 제공
+                    const answer = await vscode.window.showInformationMessage(
+                        `AI가 [${filePath}] 파일을 수정하려고 합니다.`,
+                        "Diff 보기", "바로 덮어쓰기", "건너뛰기"
+                    );
 
-                if (answer === "적용(Apply)" || answer === "모두 적용(All)") {
-                    await this._saveAgentFile(filePath, newContent);
+                    if (answer === "Diff 보기") {
+                        const tempUri = vscode.Uri.joinPath(rootUri, `${filePath}.codemind.temp`);
+                        await vscode.workspace.fs.writeFile(tempUri, Buffer.from(newContent, 'utf8'));
+                        
+                        // VS Code 내장 Diff 에디터 호출
+                        await vscode.commands.executeCommand('vscode.diff', fileUri, tempUri, `[AI 제안] ${path.basename(filePath)}`);
+                        vscode.window.showInformationMessage(`변경사항을 확인하고 수동으로 적용하거나 임시 파일을 저장하세요.`);
+                    } else if (answer === "바로 덮어쓰기") {
+                        await this._saveAgentFile(filePath, newContent);
+                    }
+                } else {
+                    // 새 파일 생성 시
+                    const answer = await vscode.window.showInformationMessage(
+                        `AI가 새 파일 [${filePath}]을(를) 생성하려고 합니다.`,
+                        "생성 허용", "건너뛰기"
+                    );
+                    if (answer === "생성 허용") {
+                        await this._saveAgentFile(filePath, newContent);
+                    }
                 }
             } catch (err: any) {
                 vscode.window.showErrorMessage(`${filePath} 처리 중 오류: ${err.message}`);
@@ -379,6 +420,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getHtmlContent(markedJsUri: vscode.Uri): string {
+        // [UX 패치] 하드코딩된 색상 제거 및 VS Code 테마 변수 (var(--vscode-...)) 적극 활용
         return `
         <!DOCTYPE html>
         <html>
@@ -388,32 +430,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/vs2015.min.css">
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
                 <style>
-                    body { font-family: -apple-system, sans-serif; color: #ccc; background-color: #1e1e1e; padding: 10px; margin: 0; overflow-x: hidden; }
-                    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 8px; margin-bottom: 10px; position: sticky; top: 0; background: #1e1e1e; z-index: 10; }
-                    .clear-btn { background: #444; color: #ccc; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+                    body { 
+                        font-family: var(--vscode-font-family), -apple-system, sans-serif; 
+                        color: var(--vscode-editor-foreground); 
+                        background-color: var(--vscode-editor-background); 
+                        padding: 10px; margin: 0; overflow-x: hidden; 
+                    }
+                    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 8px; margin-bottom: 10px; position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 10; }
+                    .clear-btn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+                    .clear-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
                     #chat { min-height: 300px; padding-bottom: 10px; }
-                    #loading { display: none; flex-direction: column; gap: 8px; padding: 12px; color: #888; font-size: 12px; }
-                    .progress-container { width: 100%; height: 4px; background-color: #333; border-radius: 2px; overflow: hidden; }
-                    .progress-bar { width: 0%; height: 100%; background: linear-gradient(90deg, #007acc, #4fc1ff); transition: width 0.3s ease; }
-                    .spinner { width: 14px; height: 14px; border: 2px solid #444; border-top: 2px solid #007acc; border-radius: 50%; animation: spin 1s linear infinite; }
+                    #loading { display: none; flex-direction: column; gap: 8px; padding: 12px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+                    .progress-container { width: 100%; height: 4px; background-color: var(--vscode-editorWidget-background); border-radius: 2px; overflow: hidden; }
+                    .progress-bar { width: 0%; height: 100%; background: linear-gradient(90deg, var(--vscode-progressBar-background), #4fc1ff); transition: width 0.3s ease; }
+                    .spinner { width: 14px; height: 14px; border: 2px solid var(--vscode-editorWidget-border); border-top: 2px solid var(--vscode-progressBar-background); border-radius: 50%; animation: spin 1s linear infinite; }
                     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                    pre { background-color: #1e1e1e; padding: 0; border-radius: 6px; position: relative; border: 1px solid #444; overflow-x: auto; margin: 10px 0; }
-                    code { font-family: 'Consolas', monospace; font-size: 13px; }
-                    .hljs { background: #1e1e1e !important; padding: 12px !important; padding-top: 35px !important; }
+                    pre { background-color: var(--vscode-textCodeBlock-background); padding: 0; border-radius: 6px; position: relative; border: 1px solid var(--vscode-panel-border); overflow-x: auto; margin: 10px 0; }
+                    code { font-family: var(--vscode-editor-font-family), 'Consolas', monospace; font-size: 13px; }
+                    .hljs { background: transparent !important; padding: 12px !important; padding-top: 35px !important; }
                     .btn-group { display: flex; gap: 5px; position: absolute; top: 5px; right: 5px; z-index: 20; }
-                    .action-btn { background: #444; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; opacity: 0.8; }
-                    .run-btn { background: #cd7f32; } 
-                    .user-msg { color: #4fc1ff; margin-top: 15px; font-weight: bold; border-left: 3px solid #4fc1ff; padding-left: 8px; font-size: 13px; }
-                    .ai-msg { background: #252526; padding: 12px; border-radius: 8px; margin-top: 5px; border: 1px solid #333; line-height: 1.6; font-size: 13px; word-wrap: break-word; }
-                    .input-container { position: sticky; bottom: 0; background: #1e1e1e; padding: 10px 0; border-top: 1px solid #333; }
-                    textarea { width: 100%; height: 70px; background: #333; color: white; border: 1px solid #555; padding: 10px; border-radius: 4px; resize: none; outline: none; box-sizing: border-box; }
-                    #sendBtn { width: 100%; height: 35px; margin-top: 5px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+                    .action-btn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 1px solid var(--vscode-button-border, transparent); border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; opacity: 0.9; }
+                    .action-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+                    .run-btn { background: var(--vscode-statusBarItem-warningBackground, #cd7f32); color: white; } 
+                    .user-msg { color: var(--vscode-textLink-foreground); margin-top: 15px; font-weight: bold; border-left: 3px solid var(--vscode-textLink-foreground); padding-left: 8px; font-size: 13px; }
+                    .ai-msg { background: var(--vscode-editorWidget-background); padding: 12px; border-radius: 8px; margin-top: 5px; border: 1px solid var(--vscode-panel-border); line-height: 1.6; font-size: 13px; word-wrap: break-word; }
+                    .input-container { position: sticky; bottom: 0; background: var(--vscode-editor-background); padding: 10px 0; border-top: 1px solid var(--vscode-panel-border); }
+                    textarea { width: 100%; height: 70px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 10px; border-radius: 4px; resize: none; outline: none; box-sizing: border-box; }
+                    textarea:focus { border-color: var(--vscode-focusBorder); }
+                    #sendBtn { width: 100%; height: 35px; margin-top: 5px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+                    #sendBtn:hover { background: var(--vscode-button-hoverBackground); }
                 </style>
             </head>
             <body>
-                <div class="header"><strong>CodeMind Gemma</strong><button class="clear-btn" onclick="clearChat()">Clear</button></div>
+                <div class="header"><strong>CodeMind AI</strong><button class="clear-btn" onclick="clearChat()">Clear</button></div>
                 <div id="chat"></div>
-                <div id="loading"><div class="loading-top"><div class="spinner"></div><span>Gemma가 생각 중...</span></div><div class="progress-container"><div id="progressBar" class="progress-bar"></div></div></div>
+                <div id="loading"><div class="loading-top"><div class="spinner"></div><span>AI가 생각 중...</span></div><div class="progress-container"><div id="progressBar" class="progress-bar"></div></div></div>
                 <div class="input-container"><textarea id="input" placeholder="명령어를 입력하세요..."></textarea><button id="sendBtn" onclick="send()">전송</button></div>
                 <script>
                     const vscode = acquireVsCodeApi();
@@ -442,7 +493,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 lastAi.className = 'ai-msg';
                                 chatDiv.appendChild(lastAi);
                             }
-                            lastAi.innerHTML = "<b>Gemma:</b><br>" + marked.parse(currentFullText);
+                            lastAi.innerHTML = "<b>AI:</b><br>" + marked.parse(currentFullText);
                             lastAi.querySelectorAll('pre code').forEach((el) => hljs.highlightElement(el));
                             window.scrollTo(0, document.body.scrollHeight);
                         } 
@@ -460,7 +511,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                     const code = block.querySelector('code').innerText;
                                     const runBtn = document.createElement('button'); runBtn.className = 'action-btn run-btn'; runBtn.innerText = 'RUN';
                                     runBtn.onclick = () => vscode.postMessage({ command: 'runTerminal', code: code });
-                                    const insBtn = document.createElement('button'); insBtn.className = 'action-btn'; insBtn.innerText = 'CREATE'; insBtn.style.backgroundColor = '#28a745';
+                                    const insBtn = document.createElement('button'); insBtn.className = 'action-btn'; insBtn.innerText = 'CREATE';
                                     insBtn.onclick = () => vscode.postMessage({ command: 'createFile', code: code });
                                     const copyBtn = document.createElement('button'); copyBtn.className = 'action-btn'; copyBtn.innerText = 'INSERT';
                                     copyBtn.onclick = () => vscode.postMessage({ command: 'insertCode', code: code });
@@ -477,13 +528,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         if(!text) return;
                         chatDiv.innerHTML += '<div class="user-msg">나: ' + text + '</div>';
                         loadingDiv.style.display = 'flex';
-                        sendBtn.innerText = "중단 (Stop)"; sendBtn.style.backgroundColor = "#d32f2f"; sendBtn.onclick = stop;
+                        sendBtn.innerText = "중단 (Stop)"; sendBtn.style.backgroundColor = "var(--vscode-errorForeground)"; sendBtn.onclick = stop;
                         let width = 0; progressInterval = setInterval(() => { width += (95 - width) * 0.1; progressBar.style.width = width + '%'; }, 300);
                         vscode.postMessage({ command: 'ask', text: text });
                         inputField.value = ''; window.scrollTo(0, document.body.scrollHeight);
                     }
                     function stop() { vscode.postMessage({ command: 'stopGeneration' }); resetSendBtn(); }
-                    function resetSendBtn() { sendBtn.innerText = "전송"; sendBtn.style.backgroundColor = "#007acc"; sendBtn.onclick = send; }
+                    function resetSendBtn() { sendBtn.innerText = "전송"; sendBtn.style.backgroundColor = "var(--vscode-button-background)"; sendBtn.onclick = send; }
                     function clearChat() { chatDiv.innerHTML = ''; vscode.postMessage({ command: 'clearHistory' }); }
                     inputField.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
                 </script>
